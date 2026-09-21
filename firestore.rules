@@ -1,0 +1,52 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.userId == userId &&
+        data.balance is number && data.balance >= 0 &&
+        data.energy is number && data.energy >= 0 &&
+        (!('telegramId' in data) || (data.telegramId is string && data.telegramId.size() <= 64)) &&
+        (!('username' in data) || (data.username is string && data.username.size() <= 100)) &&
+        (!('firstName' in data) || (data.firstName is string && data.firstName.size() <= 100)) &&
+        (!('email' in data) || (data.email is string && data.email.size() <= 320)) &&
+        (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 200)) &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1000)) &&
+        (!('totalTaps' in data) || (data.totalTaps is number && data.totalTaps >= 0)) &&
+        (!('totalEarned' in data) || (data.totalEarned is number && data.totalEarned >= 0)) &&
+        (!('profitPerHour' in data) || (data.profitPerHour is number && data.profitPerHour >= 0)) &&
+        (!('lastSaved' in data) || (data.lastSaved is number)) &&
+        (!('lastEnergyUpdate' in data) || (data.lastEnergyUpdate is number)) &&
+        (!('dailyFreeRefills' in data) || (data.dailyFreeRefills is number && data.dailyFreeRefills >= 0)) &&
+        (!('dailyFreeTurbos' in data) || (data.dailyFreeTurbos is number && data.dailyFreeTurbos >= 0)) &&
+        (!('updatedAt' in data) || (data.updatedAt is number)) &&
+        (!('tasks' in data) || (data.tasks is list && data.tasks.size() <= 100)) &&
+        (!('friends' in data) || (data.friends is list && data.friends.size() <= 500)) &&
+        (!('upgrades' in data) || (data.upgrades is map)) &&
+        (!('dailyStreak' in data) || (data.dailyStreak is map)) &&
+        (!('wallet' in data) || (data.wallet is map));
+    }
+
+    // User Profile Document - Isolated per user (Supports Telegram ID & Google Auth)
+    match /users/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if false; // Deny listing all users to protect player privacy
+      allow create: if isValidId(userId) && isValidUserProfile(incoming(), userId);
+      allow update: if isValidId(userId) && isValidUserProfile(incoming(), userId);
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,106 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile and isolated SetriCoin game state document",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Unique user ID (Telegram ID tg_xxxx or Auth UID)"
+        },
+        "telegramId": {
+          "type": "string",
+          "description": "Telegram user ID if accessed via Telegram WebApp"
+        },
+        "username": {
+          "type": "string",
+          "description": "Telegram username or handle"
+        },
+        "firstName": {
+          "type": "string",
+          "description": "User first name"
+        },
+        "email": {
+          "type": "string",
+          "description": "User Google email address"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name"
+        },
+        "photoURL": {
+          "type": "string",
+          "description": "User avatar photo URL"
+        },
+        "balance": {
+          "type": "number",
+          "description": "Current SetriCoin token balance"
+        },
+        "energy": {
+          "type": "number",
+          "description": "Current stamina energy points"
+        },
+        "profitPerHour": {
+          "type": "number",
+          "description": "Current passive earnings per hour from SetriBot"
+        },
+        "totalTaps": {
+          "type": "number",
+          "description": "Total mining taps completed by user"
+        },
+        "totalEarned": {
+          "type": "number",
+          "description": "Total lifetime SetriCoin tokens earned"
+        },
+        "lastSaved": {
+          "type": "number",
+          "description": "Epoch timestamp of last cloud sync"
+        },
+        "lastEnergyUpdate": {
+          "type": "number",
+          "description": "Epoch timestamp of last stamina regeneration"
+        },
+        "upgrades": {
+          "type": "object",
+          "description": "User upgrade levels for multitap, energy limit, and auto bot"
+        },
+        "tasks": {
+          "type": "array",
+          "description": "User active and completed quests"
+        },
+        "dailyStreak": {
+          "type": "object",
+          "description": "Daily login streak tracking"
+        },
+        "wallet": {
+          "type": "object",
+          "description": "Connected TON wallet information"
+        },
+        "friends": {
+          "type": "array",
+          "description": "Invited mining squad friends list"
+        },
+        "dailyFreeRefills": {
+          "type": "number",
+          "description": "Remaining daily free stamina refills"
+        },
+        "dailyFreeTurbos": {
+          "type": "number",
+          "description": "Remaining daily free turbo boosters"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Epoch millisecond timestamp of last profile update"
+        }
+      },
+      "required": ["userId", "balance", "energy"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile and isolated game state document"
+    }
+  }
+}

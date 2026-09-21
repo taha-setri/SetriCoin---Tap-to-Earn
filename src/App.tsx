@@ -31,66 +31,43 @@ import {
   QrCode,
   Lock,
   FileText,
-  Code2
+  Code2,
+  Cloud,
+  LogOut,
+  LogIn,
+  Send
 } from 'lucide-react';
+import {
+  auth,
+  googleProvider,
+  loadOrCreateUserGameData,
+  loadOrCreateTelegramUserGameData,
+  saveUserGameDataToCloud,
+  testFirestoreConnection,
+  CloudUserGameData
+} from './lib/firebase';
+import {
+  initTelegramWebApp,
+  getNativeTelegramUser,
+  isTelegramWebAppAvailable,
+  triggerHaptic,
+  openLinkSafely
+} from './lib/telegram';
+import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { LoginScreen } from './components/LoginScreen';
+import {
+  FloatingText,
+  Task,
+  Friend,
+  Upgrades,
+  DailyStreak,
+  WalletState,
+  MinerTier,
+  TelegramWebAppUser,
+  ActiveUserSession
+} from './types';
 
-// ================= TYPES & INTERFACES =================
-
-interface FloatingText {
-  id: number;
-  x: number;
-  y: number;
-  value: number;
-}
-
-interface Task {
-  id: string;
-  title: string;
-  category: 'telegram' | 'social' | 'special';
-  reward: number;
-  icon: string;
-  url?: string;
-  status: 'idle' | 'verifying' | 'claimable' | 'claimed';
-  countdown?: number;
-}
-
-interface Friend {
-  id: string;
-  name: string;
-  username: string;
-  tier: string;
-  earnedCoins: number;
-  avatar: string;
-  joinedDate: string;
-}
-
-interface Upgrades {
-  multitapLevel: number;
-  energyLimitLevel: number;
-  autoBotLevel: number;
-}
-
-interface DailyStreak {
-  streakDay: number;
-  lastClaimDate: string;
-}
-
-interface WalletState {
-  connected: boolean;
-  address: string;
-  provider: string;
-  tonBalance: number;
-}
-
-interface MinerTier {
-  level: number;
-  name: string;
-  minCoins: number;
-  baseTap: number;
-  color: string;
-  badgeBg: string;
-  borderColor: string;
-}
+// ================= CONSTANTS & TIERS =================
 
 // Miner Tiers Definition
 const MINER_TIERS: MinerTier[] = [
@@ -218,8 +195,20 @@ export const SetriCoinEmblem = ({
 // User's Official Telegram Wallet Referral Link
 const TELEGRAM_WALLET_REFERRAL_URL = 'https://telegram.me/wallet/start?startapp=ref-3-R_GccZDZGYs';
 
+// Official SetriCoin Telegram App Bot Link
+const SETRICOIN_BOT_URL = 'https://t.me/SetriCoin_App_bot';
+
 // Initial Tasks
 const INITIAL_TASKS: Task[] = [
+  {
+    id: 't_tg_app_bot',
+    title: 'Open SetriCoin Telegram Bot',
+    category: 'telegram',
+    reward: 30000,
+    icon: '🤖',
+    url: SETRICOIN_BOT_URL,
+    status: 'idle'
+  },
   {
     id: 't_tg_wallet_ref',
     title: 'Activate Official Telegram @wallet',
@@ -371,12 +360,26 @@ export default function App() {
   // Navigation active tab: 'mine' | 'earn' | 'friends' | 'wallet'
   const [activeTab, setActiveTab] = useState<'mine' | 'earn' | 'friends' | 'wallet'>('mine');
 
+  // ================= UNIFIED USER SESSIONS (TELEGRAM & GOOGLE) =================
+  const [activeSession, setActiveSession] = useState<ActiveUserSession | null>(null);
+  const [nativeTgUser, setNativeTgUser] = useState<TelegramWebAppUser | null>(null);
+  const [isGuestSession, setIsGuestSession] = useState<boolean>(false);
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [authBusy, setAuthBusy] = useState<boolean>(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+
+  // Cloud sync refs & debouncer
+  const syncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingSyncRef = useRef<Partial<CloudUserGameData> | null>(null);
+  const tapAccumulatorRef = useRef<number>(0);
+
   // ================= CORE PERSISTENT STATE =================
 
-  // Total balance
+  // Total balance (Starts at 0 for new players, isolated per user)
   const [balance, setBalance] = useState<number>(() => {
     const saved = localStorage.getItem('setricoin_balance');
-    return saved !== null ? Math.max(0, parseInt(saved, 10)) : 14250;
+    return saved !== null ? Math.max(0, parseInt(saved, 10)) : 0;
   });
 
   // Current Stamina/Energy
@@ -438,7 +441,7 @@ export default function App() {
       try { return JSON.parse(saved); } catch {}
     }
     return {
-      streakDay: 3,
+      streakDay: 1,
       lastClaimDate: ''
     };
   });
@@ -451,7 +454,7 @@ export default function App() {
   // Stats
   const [totalTaps, setTotalTaps] = useState<number>(() => {
     const saved = localStorage.getItem('setricoin_total_taps');
-    return saved !== null ? parseInt(saved, 10) : 412;
+    return saved !== null ? parseInt(saved, 10) : 0;
   });
 
   // ================= UI & INTERACTIVE STATES =================
@@ -474,6 +477,7 @@ export default function App() {
   const [showQrCodeInWallet, setShowQrCodeInWallet] = useState<boolean>(false);
   const [showPrivacyModal, setShowPrivacyModal] = useState<boolean>(false);
   const [copiedTgWalletRef, setCopiedTgWalletRef] = useState<boolean>(false);
+  const [copiedBotLink, setCopiedBotLink] = useState<boolean>(false);
 
   const buttonRef = useRef<HTMLDivElement>(null);
 
@@ -521,11 +525,17 @@ export default function App() {
     return Math.min(100, Math.max(0, (currentInRange / range) * 100));
   }, [balance, currentTier, nextTier]);
 
-  // Unique Referral Link
+  // Unique Referral Link with active Telegram User ID or fallback
   const referralLink = useMemo(() => {
-    const cleanId = wallet.connected ? wallet.address.slice(2, 8) : '84920';
-    return `https://t.me/SetriCoin_bot?start=ref_${cleanId}`;
-  }, [wallet.connected, wallet.address]);
+    const cleanId = activeSession?.rawId
+      ? activeSession.rawId.toString()
+      : activeSession?.id
+        ? activeSession.id.replace('tg_', '')
+        : wallet.connected
+          ? wallet.address.slice(2, 8)
+          : '84920';
+    return `${SETRICOIN_BOT_URL}?start=ref_${cleanId}`;
+  }, [activeSession, wallet.connected, wallet.address]);
 
   // ================= TOAST HELPER =================
   const showToast = useCallback((msg: string) => {
@@ -534,6 +544,246 @@ export default function App() {
       setToastMessage(null);
     }, 2800);
   }, []);
+
+  // Apply cloud data to state with offline profit & stamina recovery
+  const applyCloudDataToState = useCallback((cloudData: CloudUserGameData) => {
+    const now = Date.now();
+    const lastSaved = cloudData.lastSaved || now;
+    const lastEnergyUpdate = cloudData.lastEnergyUpdate || now;
+
+    // Calculate offline stamina recovery (+3 energy/sec, up to capacity)
+    const userUpgrades = cloudData.upgrades || { multitapLevel: 1, energyLimitLevel: 1, autoBotLevel: 1 };
+    const maxEnergyLimit = 1000 + (userUpgrades.energyLimitLevel - 1) * 500;
+    const secondsPassed = Math.max(0, Math.floor((now - lastEnergyUpdate) / 1000));
+    const recoveredEnergy = Math.min(maxEnergyLimit, (cloudData.energy ?? 1000) + secondsPassed * 3);
+
+    // Calculate offline SetriBot profit (capped at 3 hours max = 10,800 sec)
+    const botLevel = userUpgrades.autoBotLevel || 1;
+    const botRatePerHour = 600 + (botLevel * 1200);
+    const hoursPassed = Math.min(3, Math.max(0, (now - lastSaved) / (1000 * 60 * 60)));
+    const offlineCoins = Math.floor(hoursPassed * botRatePerHour);
+
+    if (offlineCoins > 100 && hoursPassed >= 0.05) {
+      setShowWelcomeBack({
+        show: true,
+        coins: offlineCoins,
+        energy: Math.max(0, recoveredEnergy - (cloudData.energy ?? 1000))
+      });
+    }
+
+    setBalance((cloudData.balance ?? 0) + offlineCoins);
+    setEnergy(recoveredEnergy);
+    setTotalTaps(cloudData.totalTaps ?? 0);
+    setUpgrades(userUpgrades);
+    if (cloudData.dailyStreak) setDailyStreak(cloudData.dailyStreak);
+    if (cloudData.wallet) setWallet(cloudData.wallet);
+    if (cloudData.friends) setFriends(cloudData.friends);
+    if (cloudData.tasks && cloudData.tasks.length > 0) {
+      const existingIds = new Set(cloudData.tasks.map(t => t.id));
+      const missing = INITIAL_TASKS.filter(t => !existingIds.has(t.id));
+      setTasks([...cloudData.tasks, ...missing]);
+    } else {
+      setTasks(INITIAL_TASKS);
+    }
+    if (cloudData.dailyFreeRefills !== undefined) setDailyFreeRefills(cloudData.dailyFreeRefills);
+    if (cloudData.dailyFreeTurbos !== undefined) setDailyFreeTurbos(cloudData.dailyFreeTurbos);
+  }, []);
+
+  // ================= OPTIMIZED CLOUD SYNC ENGINE =================
+  const flushPendingSync = useCallback(async () => {
+    if (!activeSession || !pendingSyncRef.current) return;
+    const dataToFlush = { ...pendingSyncRef.current };
+    pendingSyncRef.current = null;
+    tapAccumulatorRef.current = 0;
+
+    try {
+      setSyncStatus('syncing');
+      await saveUserGameDataToCloud(activeSession.id, dataToFlush);
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error('Background Firestore sync flush failed:', err);
+      setSyncStatus('error');
+    }
+  }, [activeSession]);
+
+  const syncToCloud = useCallback((overrides?: Partial<CloudUserGameData>, immediate = false) => {
+    if (!activeSession) return;
+    setSyncStatus('syncing');
+
+    if (syncTimeoutRef.current) {
+      clearTimeout(syncTimeoutRef.current);
+    }
+
+    const payload: Partial<CloudUserGameData> = {
+      userId: activeSession.id,
+      displayName: activeSession.displayName,
+      photoURL: activeSession.photoURL || '',
+      balance,
+      energy,
+      profitPerHour,
+      totalTaps,
+      totalEarned: balance,
+      lastSaved: Date.now(),
+      lastEnergyUpdate: Date.now(),
+      upgrades,
+      tasks,
+      dailyStreak,
+      wallet,
+      friends,
+      dailyFreeRefills,
+      dailyFreeTurbos,
+      ...overrides
+    };
+
+    const performSync = async () => {
+      try {
+        await saveUserGameDataToCloud(activeSession.id, payload);
+        setSyncStatus('synced');
+      } catch (err) {
+        console.error('Failed to sync SetriCoin progress to Firestore:', err);
+        setSyncStatus('error');
+      }
+    };
+
+    if (immediate) {
+      performSync();
+    } else {
+      syncTimeoutRef.current = setTimeout(performSync, 1500);
+    }
+  }, [activeSession, balance, energy, profitPerHour, totalTaps, upgrades, tasks, dailyStreak, wallet, friends, dailyFreeRefills, dailyFreeTurbos]);
+
+  // Flush pending taps on page hide or tab switch to guarantee no data loss
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingSync();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('beforeunload', handleVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('beforeunload', handleVisibility);
+    };
+  }, [flushPendingSync]);
+
+  // ================= TELEGRAM SIGN IN HANDLER =================
+  const handleTelegramSignIn = useCallback(async (tgUser: TelegramWebAppUser) => {
+    setAuthError(null);
+    setAuthBusy(true);
+    setAuthLoading(true);
+    try {
+      const cloudData = await loadOrCreateTelegramUserGameData(tgUser);
+      setActiveSession({
+        type: 'telegram',
+        id: `tg_${tgUser.id}`,
+        rawId: tgUser.id,
+        displayName: `${tgUser.first_name}${tgUser.last_name ? ' ' + tgUser.last_name : ''}`,
+        username: tgUser.username ? `@${tgUser.username}` : '',
+        photoURL: tgUser.photo_url || '',
+        isTelegramNative: isTelegramWebAppAvailable()
+      });
+      setIsGuestSession(false);
+      applyCloudDataToState(cloudData);
+      setSyncStatus('synced');
+      showToast(`مرحباً بك ${tgUser.first_name}! تم تفعيل الحساب السحابي بنجاح ⚡`);
+    } catch (err: any) {
+      console.error('Telegram auto-auth error:', err);
+      setAuthError('تعذر جلب البيانات السحابية لحساب تيليجرام.');
+    } finally {
+      setAuthBusy(false);
+      setAuthLoading(false);
+    }
+  }, [applyCloudDataToState, showToast]);
+
+  // ================= AUTO-AUTH LIFECYCLE ON STARTUP =================
+  useEffect(() => {
+    testFirestoreConnection();
+    initTelegramWebApp();
+
+    // 1. Detect native Telegram WebApp user on startup
+    const tgUser = getNativeTelegramUser();
+    if (tgUser) {
+      setNativeTgUser(tgUser);
+      // Auto-login Telegram user instantly with zero clicks
+      handleTelegramSignIn(tgUser);
+      return;
+    }
+
+    // 2. Browser fallback: listen for existing Google session
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setIsGuestSession(false);
+        setAuthLoading(true);
+        try {
+          const cloudData = await loadOrCreateUserGameData(user);
+          setActiveSession({
+            type: 'google',
+            id: user.uid,
+            displayName: user.displayName || 'Setri Miner',
+            photoURL: user.photoURL || '',
+            isTelegramNative: false
+          });
+          applyCloudDataToState(cloudData);
+          setSyncStatus('synced');
+        } catch (err) {
+          console.error('Error loading isolated user profile from Firestore:', err);
+          showToast('تم التبديل للوضع المحلي لتعذر الاتصال بقاعدة البيانات السحابية');
+        } finally {
+          setAuthLoading(false);
+        }
+      } else {
+        setAuthLoading(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [handleTelegramSignIn, applyCloudDataToState, showToast]);
+
+  // Google Sign-In with Popup
+  const handleGoogleSignIn = async () => {
+    setAuthError(null);
+    setAuthBusy(true);
+    try {
+      const res = await signInWithPopup(auth, googleProvider);
+      if (res.user) {
+        showToast(`مرحباً بك ${res.user.displayName || 'يا بطل'} في SetriCoin! 🎉`);
+      }
+    } catch (err: any) {
+      console.error('Google Sign-In error:', err);
+      if (err.code === 'auth/popup-blocked') {
+        setAuthError('تم حظر النافذة المنبثقة بواسطة المتصفح. يمكنك السماح بالنوافذ أو المتابعة كضيف.');
+      } else if (err.code === 'auth/popup-closed-by-user') {
+        setAuthError('تم إغلاق نافذة تسجيل الدخول قبل إتمامها.');
+      } else {
+        setAuthError(err.message || 'تعذر تسجيل الدخول بحساب Google.');
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  // Sign Out
+  const handleSignOut = async () => {
+    try {
+      if (activeSession?.type === 'google') {
+        await signOut(auth);
+      }
+      setActiveSession(null);
+      setIsGuestSession(false);
+      setBalance(0);
+      setEnergy(1000);
+      setTotalTaps(0);
+      setUpgrades({ multitapLevel: 1, energyLimitLevel: 1, autoBotLevel: 1 });
+      setTasks(INITIAL_TASKS);
+      setFriends(INITIAL_FRIENDS);
+      setDailyStreak({ streakDay: 1, lastClaimDate: '' });
+      setSyncStatus('idle');
+      showToast('تم تسجيل الخروج بنجاح 👋');
+    } catch (err) {
+      console.error('Sign-out error:', err);
+    }
+  };
 
   // ================= OFFLINE REGENERATION & LOCALSTORAGE INIT =================
   useEffect(() => {
@@ -675,6 +925,7 @@ export default function App() {
   const executeSingleTap = (clientX?: number, clientY?: number) => {
     if (energy <= 0) {
       showToast('⚡ Stamina depleted! Wait for energy recovery.');
+      triggerHaptic('error');
       if (typeof window !== 'undefined' && 'vibrate' in navigator) {
         navigator.vibrate([30, 40, 30]);
       }
@@ -684,18 +935,49 @@ export default function App() {
     const energyDeduction = Math.min(energy, tapPower);
     const coinsEarned = tapPower;
 
-    setEnergy(prev => Math.max(0, prev - energyDeduction));
-    setBalance(prev => prev + coinsEarned);
-    setTotalTaps(prev => prev + 1);
+    const newEnergy = Math.max(0, energy - energyDeduction);
+    const newBalance = balance + coinsEarned;
+    const newTaps = totalTaps + 1;
 
-    // Audio & Haptics
-    if (soundEnabled) {
-      sfx.playTap(turboActive ? 1.4 : 1.0);
+    // Instant optimistic update for 60FPS fluid tapping
+    setEnergy(newEnergy);
+    setBalance(newBalance);
+    setTotalTaps(newTaps);
+
+    // Buffer in memory for non-blocking debounced cloud sync
+    if (activeSession) {
+      pendingSyncRef.current = {
+        balance: newBalance,
+        energy: newEnergy,
+        totalTaps: newTaps,
+        totalEarned: newBalance,
+        lastSaved: Date.now(),
+        lastEnergyUpdate: Date.now()
+      };
+
+      tapAccumulatorRef.current += 1;
+      // Periodic background flush every 25 taps or 1.5s after tapping stops
+      if (tapAccumulatorRef.current >= 25) {
+        flushPendingSync();
+      } else {
+        if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+        syncTimeoutRef.current = setTimeout(() => {
+          flushPendingSync();
+        }, 1500);
+      }
     }
+
+    // Native Telegram Haptics & Vibration
+    triggerHaptic(turboActive ? 'medium' : 'light');
     if (typeof window !== 'undefined' && 'vibrate' in navigator) {
       try {
         navigator.vibrate(12);
       } catch {}
+    }
+
+    // Audio
+    if (soundEnabled) {
+      sfx.playTap(turboActive ? 1.4 : 1.0);
     }
 
     // Floating animation calculation
@@ -757,7 +1039,7 @@ export default function App() {
 
     if (task.status === 'idle') {
       if (task.url) {
-        window.open(task.url, '_blank', 'noopener,noreferrer');
+        openLinkSafely(task.url);
       }
       // Put task into 'verifying' state with 4s timer
       setTasks(prev =>
@@ -771,13 +1053,19 @@ export default function App() {
     const task = tasks.find(t => t.id === taskId);
     if (!task || task.status !== 'claimable') return;
 
-    setTasks(prev =>
-      prev.map(t => (t.id === taskId ? { ...t, status: 'claimed' } : t))
-    );
-    setBalance(prev => prev + task.reward);
+    const newTasks = tasks.map(t => (t.id === taskId ? { ...t, status: 'claimed' as const } : t));
+    const newBal = balance + task.reward;
 
+    setTasks(newTasks);
+    setBalance(newBal);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast(`🎉 Claimed +${task.reward.toLocaleString()} SETRI!`);
+
+    if (activeSession) {
+      syncToCloud({ tasks: newTasks, balance: newBal }, true);
+    }
   };
 
   // Claim Daily Streak
@@ -789,20 +1077,29 @@ export default function App() {
     }
 
     const currentReward = STREAK_REWARDS[Math.min(dailyStreak.streakDay - 1, STREAK_REWARDS.length - 1)];
-    setBalance(prev => prev + currentReward);
-    setDailyStreak(prev => ({
-      streakDay: prev.streakDay >= 7 ? 1 : prev.streakDay + 1,
+    const newBal = balance + currentReward;
+    const newStreak = {
+      streakDay: dailyStreak.streakDay >= 7 ? 1 : dailyStreak.streakDay + 1,
       lastClaimDate: todayStr
-    }));
+    };
 
+    setBalance(newBal);
+    setDailyStreak(newStreak);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast(`🔥 Claimed Day ${dailyStreak.streakDay} Reward: +${currentReward.toLocaleString()} SETRI!`);
+
+    if (activeSession) {
+      syncToCloud({ dailyStreak: newStreak, balance: newBal }, true);
+    }
   };
 
   // ================= REFERRAL SYSTEM =================
   const handleCopyReferral = () => {
     navigator.clipboard.writeText(referralLink);
     setCopiedReferral(true);
+    triggerHaptic('light');
     showToast('Referral link copied to clipboard!');
     setTimeout(() => setCopiedReferral(false), 2200);
   };
@@ -810,15 +1107,25 @@ export default function App() {
   const handleCopyTgWalletReferral = () => {
     navigator.clipboard.writeText(TELEGRAM_WALLET_REFERRAL_URL);
     setCopiedTgWalletRef(true);
+    triggerHaptic('light');
     if (soundEnabled) sfx.playSuccess();
     showToast('تم نسخ رابط إحالة Telegram Wallet بنجاح! 💼');
     setTimeout(() => setCopiedTgWalletRef(false), 2400);
   };
 
+  const handleCopyBotLink = () => {
+    navigator.clipboard.writeText(SETRICOIN_BOT_URL);
+    setCopiedBotLink(true);
+    triggerHaptic('light');
+    if (soundEnabled) sfx.playSuccess();
+    showToast('تم نسخ رابط بوت تيليجرام بنجاح! 🤖');
+    setTimeout(() => setCopiedBotLink(false), 2400);
+  };
+
   const handleShareTelegram = () => {
     const text = encodeURIComponent('🚀 Join SetriCoin on TON! Tap to mine SETRI tokens and get a +25,000 start bonus:');
     const url = encodeURIComponent(referralLink);
-    window.open(`https://t.me/share/url?url=${url}&text=${text}`, '_blank');
+    openLinkSafely(`https://t.me/share/url?url=${url}&text=${text}`);
   };
 
   // Simulate friend invite for immediate testing
@@ -837,61 +1144,108 @@ export default function App() {
       joinedDate: 'Just now'
     };
 
-    setFriends(prev => [newFriend, ...prev]);
-    setBalance(prev => prev + 25000);
+    const newFriends = [newFriend, ...friends];
+    const newBal = balance + 25000;
 
+    setFriends(newFriends);
+    setBalance(newBal);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast(`🎉 New referral joined! You received +25,000 SETRI bonus!`);
+
+    if (activeSession) {
+      syncToCloud({ friends: newFriends, balance: newBal }, true);
+    }
   };
 
   // ================= UPGRADES & BOOSTERS =================
   const handleBuyMultitap = () => {
     if (balance < multitapCost) {
       showToast('Insufficient SETRI coins for this upgrade.');
+      triggerHaptic('error');
       return;
     }
-    setBalance(prev => prev - multitapCost);
-    setUpgrades(prev => ({ ...prev, multitapLevel: prev.multitapLevel + 1 }));
+    const newBal = balance - multitapCost;
+    const newUpgrades = { ...upgrades, multitapLevel: upgrades.multitapLevel + 1 };
+
+    setBalance(newBal);
+    setUpgrades(newUpgrades);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast(`Upgraded Multitap to Level ${upgrades.multitapLevel + 1}! (+1 coin/tap)`);
+
+    if (activeSession) {
+      syncToCloud({ balance: newBal, upgrades: newUpgrades }, true);
+    }
   };
 
   const handleBuyEnergyLimit = () => {
     if (balance < energyLimitCost) {
       showToast('Insufficient SETRI coins for this upgrade.');
+      triggerHaptic('error');
       return;
     }
-    setBalance(prev => prev - energyLimitCost);
-    setUpgrades(prev => ({ ...prev, energyLimitLevel: prev.energyLimitLevel + 1 }));
-    setEnergy(prev => prev + 500);
+    const newBal = balance - energyLimitCost;
+    const newUpgrades = { ...upgrades, energyLimitLevel: upgrades.energyLimitLevel + 1 };
+    const newEnergy = energy + 500;
+
+    setBalance(newBal);
+    setUpgrades(newUpgrades);
+    setEnergy(newEnergy);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast(`Upgraded Max Stamina! (+500 capacity)`);
+
+    if (activeSession) {
+      syncToCloud({ balance: newBal, upgrades: newUpgrades, energy: newEnergy }, true);
+    }
   };
 
   const handleBuyAutoBot = () => {
     if (balance < autoBotCost) {
       showToast('Insufficient SETRI coins for this upgrade.');
+      triggerHaptic('error');
       return;
     }
-    setBalance(prev => prev - autoBotCost);
-    setUpgrades(prev => ({ ...prev, autoBotLevel: prev.autoBotLevel + 1 }));
+    const newBal = balance - autoBotCost;
+    const newUpgrades = { ...upgrades, autoBotLevel: upgrades.autoBotLevel + 1 };
+
+    setBalance(newBal);
+    setUpgrades(newUpgrades);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast(`SetriBot upgraded to Level ${upgrades.autoBotLevel + 1}! (+1,200/hr passive)`);
+
+    if (activeSession) {
+      syncToCloud({ balance: newBal, upgrades: newUpgrades }, true);
+    }
   };
 
   const handleActivateTurbo = () => {
     if (turboActive) return;
     if (dailyFreeTurbos <= 0) {
       showToast('No free turbos remaining today.');
+      triggerHaptic('error');
       return;
     }
-    setDailyFreeTurbos(prev => Math.max(0, prev - 1));
+    const newTurbos = Math.max(0, dailyFreeTurbos - 1);
+    setDailyFreeTurbos(newTurbos);
     setTurboActive(true);
     setTurboTimeLeft(30);
     setEnergy(maxEnergy);
     setShowBoostModal(false);
+
+    triggerHaptic('medium');
     if (soundEnabled) sfx.playSuccess();
     showToast('🚀 5X Turbo Mode & Full Stamina activated for 30s!');
+
+    if (activeSession) {
+      syncToCloud({ dailyFreeTurbos: newTurbos, energy: maxEnergy }, true);
+    }
   };
 
   const handleRefillEnergy = () => {
@@ -901,13 +1255,21 @@ export default function App() {
     }
     if (dailyFreeRefills <= 0) {
       showToast('No free refills remaining today.');
+      triggerHaptic('error');
       return;
     }
-    setDailyFreeRefills(prev => Math.max(0, prev - 1));
+    const newRefills = Math.max(0, dailyFreeRefills - 1);
+    setDailyFreeRefills(newRefills);
     setEnergy(maxEnergy);
     setShowBoostModal(false);
+
+    triggerHaptic('success');
     if (soundEnabled) sfx.playSuccess();
     showToast('⚡ Stamina 100% recharged!');
+
+    if (activeSession) {
+      syncToCloud({ dailyFreeRefills: newRefills, energy: maxEnergy }, true);
+    }
   };
 
   // ================= WALLET CONNECT / DISCONNECT =================
@@ -916,32 +1278,42 @@ export default function App() {
 
     setTimeout(() => {
       const generatedAddr = 'UQ' + Math.random().toString(36).substring(2, 6).toUpperCase() + '...' + Math.random().toString(36).substring(2, 6).toUpperCase();
-      setWallet({
+      const newWallet: WalletState = {
         connected: true,
         address: generatedAddr,
         provider: providerName,
         tonBalance: 2.45
-      });
+      };
+      setWallet(newWallet);
       setConnectingWallet(null);
       setShowWalletModal(false);
 
       // Complete wallet task automatically if present
-      setTasks(prev =>
-        prev.map(t => (t.id === 't4' ? { ...t, status: 'claimable' } : t))
-      );
+      const updatedTasks = tasks.map(t => (t.id === 't4' ? { ...t, status: 'claimable' as const } : t));
+      setTasks(updatedTasks);
 
+      triggerHaptic('success');
       if (soundEnabled) sfx.playSuccess();
       showToast(`Connected ${providerName} (${generatedAddr})`);
+
+      if (activeSession) {
+        syncToCloud({ wallet: newWallet, tasks: updatedTasks }, true);
+      }
     }, 1200);
   };
 
   const handleDisconnectWallet = () => {
-    setWallet(prev => ({
-      ...prev,
+    const disconnectedWallet: WalletState = {
+      ...wallet,
       connected: false
-    }));
+    };
+    setWallet(disconnectedWallet);
     setShowWalletModal(false);
     showToast('Wallet disconnected.');
+
+    if (activeSession) {
+      syncToCloud({ wallet: disconnectedWallet }, true);
+    }
   };
 
   // Copy Founder Ethereum Address
@@ -971,6 +1343,43 @@ export default function App() {
     setBalance(prev => prev + 50000);
     showToast('+50,000 test SETRI added to balance!');
   };
+
+  // Loading screen during Firebase Auth initialization
+  if (authLoading && !isGuestSession) {
+    return (
+      <div className="min-h-screen bg-[#07090e] text-slate-100 flex items-center justify-center font-sans">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-16 h-16 rounded-2xl bg-slate-900 border border-cyan-500/40 flex items-center justify-center p-2 shadow-xl shadow-cyan-500/20">
+            <SetriCoinEmblem size={42} animated />
+          </div>
+          <div className="flex items-center gap-2 text-cyan-400 text-xs font-mono">
+            <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
+            <span>Connecting to SetriCoin Cloud...</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Login Screen (Telegram Auto-Auth / Google / Guest)
+  if (!activeSession && !isGuestSession) {
+    return (
+      <div className="min-h-screen bg-[#07090e] text-slate-100 flex justify-center selection:bg-cyan-500/30 font-sans select-none">
+        <LoginScreen
+          onSignInGoogle={handleGoogleSignIn}
+          onSignInTelegram={handleTelegramSignIn}
+          onContinueGuest={() => {
+            setIsGuestSession(true);
+            showToast('بدء التعدين في وضع الضيف المحلي');
+          }}
+          nativeTelegramUser={nativeTgUser}
+          loading={authBusy}
+          error={authError}
+          SetriCoinEmblem={SetriCoinEmblem}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#07090e] text-slate-100 flex justify-center selection:bg-cyan-500/30 font-sans select-none">
@@ -1007,12 +1416,84 @@ export default function App() {
                 <span className={`font-semibold ${currentTier.color}`}>{currentTier.name}</span>
                 <span className="text-slate-600">•</span>
                 <span className="text-slate-400 font-mono">Lvl {currentTier.level}</span>
+                <span className="text-slate-600">•</span>
+                {syncStatus === 'syncing' ? (
+                  <span className="flex items-center gap-1 text-[10px] text-cyan-400 font-mono" title="جاري المزامنة السحابية...">
+                    <Loader2 className="w-3 h-3 animate-spin text-cyan-400" />
+                    <span className="hidden sm:inline">Syncing</span>
+                  </span>
+                ) : syncStatus === 'synced' ? (
+                  <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-mono" title="متزامن مع Firebase Cloud">
+                    <Cloud className="w-3 h-3 text-emerald-400" />
+                    <span className="hidden sm:inline">Cloud</span>
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1 text-[10px] text-amber-400 font-mono" title="حساب محلي / ضيف">
+                    <Cloud className="w-3 h-3 text-amber-400 opacity-60" />
+                  </span>
+                )}
               </div>
             </div>
           </div>
 
-          {/* Right Controls: Privacy, Support Founders, Sound & Connect Wallet */}
-          <div className="flex items-center gap-2">
+          {/* Right Controls: User Avatar/SignOut, Telegram Bot, Privacy, Support Founders, Sound & Connect Wallet */}
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            {/* Active User Session (Telegram or Google) */}
+            {activeSession ? (
+              <div className="flex items-center gap-1 bg-slate-900/90 border border-slate-800 hover:border-slate-700 rounded-xl p-1 shadow-sm">
+                {activeSession.type === 'telegram' ? (
+                  <div className="flex items-center gap-1 px-1">
+                    <div className="w-6 h-6 rounded-lg bg-[#24A1DE]/20 text-[#24A1DE] font-bold text-xs flex items-center justify-center border border-[#24A1DE]/40">
+                      <Send className="w-3 h-3" />
+                    </div>
+                    <span className="text-[11px] font-medium text-slate-300 max-w-[70px] truncate hidden sm:inline">
+                      {activeSession.username ? `@${activeSession.username}` : activeSession.displayName}
+                    </span>
+                  </div>
+                ) : activeSession.photoURL ? (
+                  <img
+                    src={activeSession.photoURL}
+                    alt={activeSession.displayName || 'User'}
+                    className="w-6 h-6 rounded-lg object-cover border border-cyan-500/40"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="w-6 h-6 rounded-lg bg-cyan-500/20 text-cyan-400 font-bold text-xs flex items-center justify-center">
+                    {activeSession.displayName ? activeSession.displayName[0].toUpperCase() : 'U'}
+                  </div>
+                )}
+                <button
+                  onClick={handleSignOut}
+                  className="w-6 h-6 rounded-lg hover:bg-red-500/20 text-slate-400 hover:text-red-400 flex items-center justify-center transition-colors cursor-pointer"
+                  title={`تسجيل الخروج (${activeSession.displayName || activeSession.id})`}
+                >
+                  <LogOut className="w-3 h-3" />
+                </button>
+              </div>
+            ) : isGuestSession ? (
+              <button
+                onClick={() => setIsGuestSession(false)}
+                className="px-2 py-1 rounded-xl bg-slate-900 border border-cyan-500/40 text-[10px] font-bold text-cyan-300 hover:text-white flex items-center gap-1 cursor-pointer"
+                title="تسجيل الدخول وربط الحساب السحابي"
+              >
+                <LogIn className="w-3 h-3 text-cyan-400" />
+                <span>Login</span>
+              </button>
+            ) : null}
+
+            {/* Telegram Bot Direct Launch */}
+            <a
+              id="telegram-bot-header-btn"
+              href={SETRICOIN_BOT_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-8 h-8 rounded-xl bg-slate-900 border border-slate-800 hover:border-cyan-500/50 text-cyan-400 hover:text-cyan-300 flex items-center justify-center active:scale-95 transition-all relative group"
+              title="فتح بوت تيليجرام الرسمي (@SetriCoin_App_bot)"
+            >
+              <Bot className="w-4 h-4 text-cyan-400 group-hover:scale-110 transition-transform" />
+              <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            </a>
+
             {/* Privacy & Security Policy Button */}
             <button
               id="privacy-policy-btn"
@@ -1157,6 +1638,20 @@ export default function App() {
                       {Math.max(0, nextTier.minCoins - balance).toLocaleString()} coins to {nextTier.name}
                     </div>
                   )}
+                </div>
+
+                {/* Quick Telegram Bot Launcher */}
+                <div className="mt-3">
+                  <a
+                    href={SETRICOIN_BOT_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-cyan-950/50 hover:bg-cyan-900/60 border border-cyan-500/30 text-cyan-300 hover:text-white text-[11px] font-medium transition-all active:scale-95 shadow-sm"
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+                    <span>بوت تيليجرام: @SetriCoin_App_bot</span>
+                    <ExternalLink className="w-3 h-3 text-cyan-400" />
+                  </a>
                 </div>
               </div>
 
@@ -1526,6 +2021,67 @@ export default function App() {
                   <div className="text-xl font-extrabold text-yellow-400 font-mono mt-1">
                     +{friends.reduce((acc, f) => acc + f.earnedCoins, 0).toLocaleString()}
                   </div>
+                </div>
+              </div>
+
+              {/* ================= OFFICIAL SETRICOIN TELEGRAM BOT CARD ================= */}
+              <div className="bg-gradient-to-br from-[#0c2333] via-slate-900 to-[#07131e] border border-cyan-500/40 rounded-2xl p-4 shadow-xl relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-400/10 rounded-full blur-3xl pointer-events-none" />
+
+                <div className="flex items-center justify-between mb-2.5">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-9 h-9 rounded-xl bg-cyan-500/20 border border-cyan-400/40 flex items-center justify-center text-cyan-400 font-bold text-base shadow-md shadow-cyan-500/15">
+                      <Bot className="w-5 h-5 text-cyan-400" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <h3 className="text-xs font-bold text-white">بوت تيليجرام الرسمي (@SetriCoin_App_bot)</h3>
+                        <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-500/25 text-cyan-300 border border-cyan-400/30">
+                          Official Bot
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-400">Telegram App Mini App Bot</p>
+                    </div>
+                  </div>
+                  <span className="text-[10px] font-bold text-cyan-400 px-2 py-0.5 rounded bg-cyan-500/10 border border-cyan-500/20">
+                    Live
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-slate-300 mb-3 leading-relaxed text-right">
+                  الرابط الرسمي المعتمد لبوت تطبيق SetriCoin على تيليجرام لبدء التعدين ومزامنة النقاط مع حسابك فوراً:
+                </p>
+
+                {/* Bot URL Box */}
+                <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-2.5 mb-2.5">
+                  <div className="text-[10px] text-slate-400 font-semibold mb-1 flex items-center justify-between">
+                    <span>رابط البوت المباشر:</span>
+                    <span className="text-cyan-400 font-mono text-[9px]">@SetriCoin_App_bot</span>
+                  </div>
+                  <div className="font-mono text-xs text-cyan-300 break-all select-all font-semibold bg-slate-900/80 px-2 py-1.5 rounded-lg border border-slate-800">
+                    {SETRICOIN_BOT_URL}
+                  </div>
+                </div>
+
+                {/* Action Buttons */}
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={handleCopyBotLink}
+                    className="py-2.5 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-200 hover:text-white font-bold text-xs flex items-center justify-center gap-1.5 border border-slate-700 transition-all active:scale-95"
+                  >
+                    {copiedBotLink ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedBotLink ? 'تم النسخ!' : 'نسخ رابط البوت'}</span>
+                  </button>
+
+                  <a
+                    href={SETRICOIN_BOT_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-cyan-500/25 transition-all active:scale-95"
+                  >
+                    <span>تشغيل البوت</span>
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </a>
                 </div>
               </div>
 
