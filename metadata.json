@@ -1,0 +1,6 @@
+{
+  "name": "SetriCoin - Tap to Earn",
+  "description": "Telegram mini-app style Tap-to-Earn crypto mining Web3 application on the TON ecosystem.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
